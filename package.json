@@ -1,0 +1,19 @@
+{
+  "name": "qatool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "db:migrate:local": "wrangler d1 migrations apply qatool --local",
+    "db:migrate:remote": "wrangler d1 migrations apply qatool --remote",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "node scripts/smoke.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261124.2",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.168.0"
+  }
+}

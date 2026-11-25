@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "qatool",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  // 관리자 페이지(/admin), SDK(/sdk/qa-report.js), 데모 게임(/demo)은 정적 파일로,
+  // /api/* 만 Worker 코드가 처리합니다.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "qatool",
+      // `npx wrangler d1 create qatool` 로 만든 뒤 나온 id 로 바꾸세요 (로컬 개발에는 필요 없음)
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SHOTS",
+      // `npx wrangler r2 bucket create qatool-shots`
+      "bucket_name": "qatool-shots"
+    }
+  ],
+  "vars": {
+    // 한 곳(IP)에서 한 시간에 받을 수 있는 신고 수
+    "RATE_LIMIT_PER_HOUR": "10",
+    // 화면 사진 최대 크기 (바이트)
+    "MAX_SHOT_BYTES": "716800"
+  }
+  // 비밀 값은 vars 가 아니라 secret 으로:
+  //   npx wrangler secret put ADMIN_KEY          (관리자 페이지 열쇠, 필수)
+  //   npx wrangler secret put IP_SALT            (IP를 해시할 때 섞는 값, 필수)
+  //   npx wrangler secret put DISCORD_WEBHOOK_URL (새 신고 알림, 선택)
+}

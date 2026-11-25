@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>데모 게임 — 별 모으기</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0f1320; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+    .hud { position: fixed; left: 10px; top: 8px; display: flex; gap: 8px; }
+    .hud button { border: 0; border-radius: 8px; padding: 6px 10px; background: #2b3553; color: #fff; font: inherit; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div class="hud">
+    <button id="next">다음 단계</button>
+    <button id="broken">고장 난 단추</button>
+  </div>
+  <script src="/sdk/qa-report.js"></script>
+  <script>
+    // ── 아주 작은 시험용 게임: 화살표/터치로 움직여 별을 모읍니다 ──
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const game = { stage: 1, score: 0, x: 200, y: 200, tx: null, ty: null, stars: [], paused: false, keys: {} };
+
+    function resize() { canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio; }
+    addEventListener('resize', resize); resize();
+
+    function newStage() {
+      game.stars = Array.from({ length: 4 + game.stage * 2 }, () => ({ x: Math.random() * innerWidth, y: 60 + Math.random() * (innerHeight - 90) }));
+      QAReport.note('단계', game.stage + '단계 시작 (별 ' + game.stars.length + '개)');
+    }
+
+    QAReport.init({
+      endpoint: location.origin,
+      project: 'demo',
+      version: '0.1.0',
+      channel: 'test',
+      platform: 'web',
+      build: new Date().toISOString().slice(0, 10),
+      canvas: '#game',
+      getContext: () => ({ stage: game.stage, score: game.score, starsLeft: game.stars.length }),
+      onPause: () => { game.paused = true; },
+      onResume: () => { game.paused = false; },
+    });
+    newStage();
+
+    addEventListener('keydown', (e) => { game.keys[e.key] = true; });
+    addEventListener('keyup', (e) => { game.keys[e.key] = false; });
+    canvas.addEventListener('pointerdown', (e) => { game.tx = e.clientX; game.ty = e.clientY; QAReport.note('누름', '이동 ' + Math.round(e.clientX) + ',' + Math.round(e.clientY)); });
+
+    document.getElementById('next').onclick = () => { QAReport.note('누름', '다음 단계'); game.stage++; newStage(); };
+    document.getElementById('broken').onclick = () => {
+      QAReport.note('누름', '고장 난 단추');
+      const door = null;
+      door.open(); // 일부러 TypeError — 신고 창에서 '오류'가 미리 골라지는지 확인용
+    };
+
+    function tick() {
+      if (!game.paused) {
+        const sp = 4;
+        if (game.keys.ArrowLeft) game.x -= sp; if (game.keys.ArrowRight) game.x += sp;
+        if (game.keys.ArrowUp) game.y -= sp; if (game.keys.ArrowDown) game.y += sp;
+        if (game.tx != null) { game.x += (game.tx - game.x) * 0.1; game.y += (game.ty - game.y) * 0.1; }
+        game.stars = game.stars.filter((s) => {
+          const hit = Math.hypot(s.x - game.x, s.y - game.y) < 22;
+          if (hit) { game.score++; QAReport.note('점수', '별 획득 (' + game.score + ')'); }
+          return !hit;
+        });
+        if (!game.stars.length) { game.stage++; newStage(); }
+      }
+      const d = devicePixelRatio;
+      ctx.setTransform(d, 0, 0, d, 0, 0);
+      ctx.fillStyle = '#0f1320'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+      ctx.fillStyle = '#ffd34d';
+      for (const s of game.stars) { ctx.beginPath(); ctx.arc(s.x, s.y, 9, 0, 7); ctx.fill(); }
+      ctx.fillStyle = '#5ad1ff'; ctx.fillRect(game.x - 14, game.y - 14, 28, 28);
+      ctx.fillStyle = '#fff'; ctx.font = '16px system-ui';
+      ctx.fillText(game.stage + '단계 · 점수 ' + game.score + (game.paused ? ' · 멈춤' : ''), 10, innerHeight - 14);
+      requestAnimationFrame(tick);
+    }
+    tick();
+  </script>
+</body>
+</html>
