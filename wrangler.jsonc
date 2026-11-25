@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "qatool",
+	"name": "s-qatools",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-11-01",
 	// 관리자 페이지(/admin), SDK(/sdk/qa-report.js), 데모 게임(/demo)은 정적 파일로,
