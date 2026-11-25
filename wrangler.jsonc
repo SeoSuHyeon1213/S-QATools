@@ -61,8 +61,8 @@
 		"RATE_LIMIT_PER_HOUR": "10",
 		// 화면 사진 최대 크기 (바이트)
 		"MAX_SHOT_BYTES": "716800",
-		// 알림 메시지에 넣을 관리자 페이지 주소. 배포 뒤 실제 주소로 바꾸세요 (예: https://qatool.<계정>.workers.dev)
-		"PUBLIC_URL": ""
+		// 알림 메시지에 넣을 관리자 페이지 주소 (끝에 / 없이)
+		"PUBLIC_URL": "https://s-qatools.giornogiobana1234.workers.dev"
 	}
 	// 비밀 값은 vars 가 아니라 secret 으로:
 	//   npx wrangler secret put ADMIN_KEY          (관리자 페이지 열쇠, 필수)
