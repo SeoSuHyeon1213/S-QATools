@@ -154,6 +154,7 @@ function topBar(tab) {
       <h1>📣 QA 신고함</h1>
       <nav class="tabs">
         <a href="#/" class="${tab === 'reports' ? 'on' : ''}">신고</a>
+        <a href="#/ops" class="${tab === 'ops' ? 'on' : ''}">관제</a>
         <a href="#/projects" class="${tab === 'projects' ? 'on' : ''}">게임 · 연결</a>
       </nav>
       <select id="projectSel" aria-label="게임 고르기">
@@ -259,7 +260,7 @@ async function loadStats() {
   try {
     S.stats = await api('/stats' + (S.project ? '?project=' + encodeURIComponent(S.project) : ''));
     const top = $('.top');
-    if (top) top.outerHTML = topBar(location.hash.startsWith('#/projects') ? 'projects' : 'reports')[RAW];
+    if (top) top.outerHTML = topBar(currentTab())[RAW];
   } catch (e) { fail(e); }
 }
 
@@ -558,7 +559,8 @@ document.addEventListener('change', (e) => {
   S.project = e.target.value;
   localStorage.setItem('qa-admin-project', S.project);
   loadStats();
-  if (location.hash.startsWith('#/projects')) return;
+  if (currentTab() === 'ops') return renderOps();
+  if (currentTab() !== 'reports') return;
   loadList();
 });
 
@@ -566,11 +568,18 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { const lb = $('.lightbox'); if (lb) lb.remove(); }
 });
 
+function currentTab() {
+  const h = location.hash;
+  return h.startsWith('#/projects') ? 'projects' : h.startsWith('#/ops') ? 'ops' : 'reports';
+}
+
 // ───────────── 길 찾기 ─────────────
 async function route() {
   if (!S.key) return renderLogin();
   const h = location.hash || '#/';
+  stopOpsTimer();
   if (h.startsWith('#/projects')) return renderProjects();
+  if (h.startsWith('#/ops')) return renderOps();
   if (!$('#layout')) {
     renderReportsShell();
     await loadList();
@@ -595,7 +604,7 @@ async function start() {
 
 window.addEventListener('hashchange', () => {
   // 프로젝트 화면에서 신고 화면으로 돌아오면 다시 그림
-  if (!location.hash.startsWith('#/projects') && !$('#layout')) $('#app').innerHTML = '';
+  if (currentTab() === 'reports' && !$('#layout')) $('#app').innerHTML = '';
   route();
 });
 

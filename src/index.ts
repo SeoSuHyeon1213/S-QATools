@@ -8,6 +8,8 @@
  * 정적 파일(public/): /admin 관리자 페이지, /sdk/qa-report.js 게임용 SDK, /demo 데모 게임
  */
 
+import { alert, checkHealth, count, errMessage, failure, HOUR, log, routeName } from './ops';
+
 export interface Env {
   DB: D1Database;
   SHOTS: R2Bucket;
@@ -17,6 +19,9 @@ export interface Env {
   DISCORD_WEBHOOK_URL?: string;
   RATE_LIMIT_PER_HOUR?: string;
   MAX_SHOT_BYTES?: string;
+  /** 알림 메시지에 넣을 관리자 페이지 주소 (예: https://qatool.<계정>.workers.dev) */
+  PUBLIC_URL?: string;
+  CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
 }
 
 const STATUSES = ['new', 'confirmed', 'fixing', 'done', 'wontfix'] as const;
@@ -27,7 +32,6 @@ const RATINGS = ['good', 'meh', 'bad'];
 const PLATFORMS = ['toss', 'gamejolt', 'web', 'other'];
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
-const HOUR = 60 * 60 * 1000;
 
 class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -150,12 +154,18 @@ const KIND_LABEL: Record<string, string> = {
   bug: '🐞 오류', stuck: '🧭 막힘', art_sound: '🎨 그림·소리', fun: '😀 재미', lesson: '💡 교훈', suggestion: '💬 제안', other: '✏️ 그 밖',
 };
 
+const OUTCOME: Record<number, string> = {
+  400: 'report.invalid', 403: 'report.rejected_origin', 404: 'report.unknown_project', 413: 'report.too_large', 429: 'report.rate_limited',
+};
+
 async function submitReport(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const origin = request.headers.get('Origin');
   const cors = corsHeaders(origin);
+  const ray = request.headers.get('CF-Ray');
+  let projectId: string | null = null;
   try {
     const body = await readJsonBody(request);
-    const projectId = str(body.project, 64);
+    projectId = str(body.project, 64);
     if (!projectId) throw new HttpError(400, 'project 가 없어요');
 
     const project = await env.DB.prepare('SELECT id, name, allowed_origins, active FROM projects WHERE id = ?')
@@ -191,29 +201,34 @@ async function submitReport(request: Request, env: Env, ctx: ExecutionContext): 
 
     // 사진은 R2 에, 데이터베이스에는 키만
     let shotKey: string | null = null;
+    let shotBytes: number | null = null;
     if (shotUrl) {
       const shot = decodeShot(shotUrl, Number(env.MAX_SHOT_BYTES || 716800));
       const key = `shots/${project.id}/${new Date(now).toISOString().slice(0, 10)}/${crypto.randomUUID()}.${shot.ext}`;
       try {
         await env.SHOTS.put(key, shot.bytes, { httpMetadata: { contentType: shot.type } });
         shotKey = key;
+        shotBytes = shot.bytes.length;
       } catch (e) {
-        console.error('R2 저장 실패, 사진 없이 저장합니다', e);
+        // 사진 없이라도 신고는 저장
+        failure(env, ctx, 'r2.put', e, ray, { project: project.id });
       }
     }
 
     const row = await env.DB.prepare(
-      `INSERT INTO reports (project_id, kind, rating, message, version, channel, platform, context, env, trail, shot_key, ip_hash, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      `INSERT INTO reports (project_id, kind, rating, message, version, channel, platform, context, env, trail, shot_key, shot_bytes, ip_hash, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     )
       .bind(
         project.id, kind, rating, message,
         str(body.version, 40), str(body.channel, 20), str(body.platform, 20),
         smallJson(body.context, 4000), smallJson(body.env, 2000), cleanTrail(body.trail),
-        shotKey, ipHash, now, now,
+        shotKey, shotBytes, ipHash, now, now,
       )
       .first<{ id: number }>();
     const id = row!.id;
+    count(env, ctx, 'report.accepted', project.id);
+    log('info', 'report.accepted', { id, project: project.id, kind, channel: str(body.channel, 20), version: str(body.version, 40), shot: !!shotKey, trail: Array.isArray(body.trail) ? body.trail.length : 0 });
 
     if (env.DISCORD_WEBHOOK_URL) {
       const adminUrl = `${new URL(request.url).origin}/admin/#/r/${id}`;
@@ -224,28 +239,39 @@ async function submitReport(request: Request, env: Env, ctx: ExecutionContext): 
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: line, allowed_mentions: { parse: [] } }),
-        }).catch((e) => console.error('디스코드 알림 실패', e)),
+        })
+          .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); })
+          .catch((e) => { log('warn', 'notify.failed', { id, error: errMessage(e) }); return count(env, null, 'notify.error'); }),
       );
     }
 
     return json({ ok: true, id }, 201, cors);
   } catch (e) {
-    if (e instanceof HttpError) return json({ ok: false, error: e.message }, e.status, cors);
-    console.error(e);
+    if (e instanceof HttpError) {
+      const outcome = OUTCOME[e.status] ?? 'report.invalid';
+      count(env, ctx, outcome, projectId ?? '');
+      log('warn', outcome, { project: projectId, origin, reason: e.message });
+      return json({ ok: false, error: e.message }, e.status, cors);
+    }
+    failure(env, ctx, 'report.submit', e, ray, { project: projectId });
     return json({ ok: false, error: '서버 오류' }, 500, cors);
   }
 }
 
 // ───────────────────────────── 관리자 ─────────────────────────────
 
-async function checkAdmin(request: Request, env: Env) {
+async function checkAdmin(request: Request, env: Env, ctx: ExecutionContext) {
   if (!env.ADMIN_KEY) throw new HttpError(503, 'ADMIN_KEY 가 설정되지 않았어요 (wrangler secret put ADMIN_KEY)');
   const given = (request.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '');
   const [a, b] = await Promise.all([sha256Hex(given), sha256Hex(env.ADMIN_KEY)]);
   const enc = new TextEncoder();
   // @ts-ignore - Workers 런타임 전용 API
   const same = crypto.subtle.timingSafeEqual ? crypto.subtle.timingSafeEqual(enc.encode(a), enc.encode(b)) : a === b;
-  if (!given || !same) throw new HttpError(401, '관리자 열쇠가 맞지 않아요');
+  if (!given || !same) {
+    count(env, ctx, 'admin.auth_failed');
+    log('warn', 'admin.auth_failed', { ip_country: request.headers.get('CF-IPCountry') });
+    throw new HttpError(401, '관리자 열쇠가 맞지 않아요');
+  }
 }
 
 const LIST_COLUMNS = `id, project_id, kind, rating, substr(message, 1, 200) AS message, version, channel, platform,
@@ -431,14 +457,148 @@ async function updateProject(id: string, request: Request, env: Env) {
   return json({ ok: true });
 }
 
-async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response> {
-  await checkAdmin(request, env);
+// ───────────────────────────── 관제 ─────────────────────────────
+
+async function setState(env: Env, key: string, value: unknown) {
+  await env.DB.prepare('INSERT INTO ops_state (key, value, at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = excluded.at')
+    .bind(key, JSON.stringify(value), Date.now()).run();
+}
+
+async function opsOverview(url: URL, env: Env) {
+  const hours = Math.min(24 * 14, Math.max(1, Number(url.searchParams.get('hours')) || 24));
+  const project = url.searchParams.get('project') || '';
+  const nowHour = Math.floor(Date.now() / HOUR);
+  const fromHour = nowHour - hours + 1;
+  // 서버 오류처럼 게임과 상관없는 사건(project_id = '')은 게임을 골라도 함께 보임
+  const pw = project ? `AND (project_id = ? OR project_id = '')` : '';
+  const pa = project ? [project] : [];
+  const [health, batch] = await Promise.all([
+    checkHealth(env),
+    env.DB.batch([
+      env.DB.prepare(`SELECT hour, event, SUM(count) AS n FROM ops_counters WHERE hour >= ? ${pw} GROUP BY hour, event ORDER BY hour`).bind(fromHour, ...pa),
+      env.DB.prepare('SELECT at, source, message, ray FROM ops_errors WHERE at >= ? ORDER BY at DESC LIMIT 30').bind(fromHour * HOUR),
+      env.DB.prepare(`SELECT COUNT(*) AS reports, COALESCE(SUM(shot_key IS NOT NULL), 0) AS shots, COALESCE(SUM(shot_bytes), 0) AS shot_bytes,
+        (SELECT COUNT(*) FROM report_events) AS events FROM reports`),
+      env.DB.prepare(`SELECT MAX(created_at) AS at FROM reports ${project ? 'WHERE project_id = ?' : ''}`).bind(...pa),
+      env.DB.prepare(`SELECT key, value, at FROM ops_state WHERE key NOT LIKE 'alert:%'`),
+      env.DB.prepare('SELECT COUNT(*) AS n, MAX(last_at) AS last_at FROM origin_rejections'),
+    ]),
+  ]);
+  const [counters, errors, storage, last, state, rejections] = batch;
+  const totals: Record<string, number> = {};
+  for (const c of counters.results as { event: string; n: number }[]) totals[c.event] = (totals[c.event] ?? 0) + c.n;
+  const st = Object.fromEntries(
+    (state.results as { key: string; value: string; at: number }[]).map((x) => {
+      let v: unknown = x.value;
+      try { v = JSON.parse(x.value); } catch { /* 그대로 */ }
+      return [x.key, { value: v, at: x.at }];
+    }),
+  );
+  const s0 = (storage.results[0] ?? {}) as Record<string, number>;
+  return json({
+    health,
+    hours,
+    from_hour: fromHour,
+    now_hour: nowHour,
+    counters: counters.results,
+    totals,
+    errors: errors.results,
+    storage: { db_bytes: storage.meta.size_after ?? null, reports: s0.reports ?? 0, shots: s0.shots ?? 0, shot_bytes: s0.shot_bytes ?? 0, events: s0.events ?? 0 },
+    last_report_at: (last.results[0] as { at: number | null } | undefined)?.at ?? null,
+    cron: st['cron.last'] ?? null,
+    daily: st['daily.last'] ?? null,
+    rejections: rejections.results[0] ?? null,
+    alerts: { discord: !!env.DISCORD_WEBHOOK_URL },
+  });
+}
+
+async function testAlert(env: Env) {
+  if (!env.DISCORD_WEBHOOK_URL) throw new HttpError(400, 'DISCORD_WEBHOOK_URL 이 설정되지 않았어요 (wrangler secret put DISCORD_WEBHOOK_URL)');
+  const sent = await alert(env, 'test:' + Date.now(), '✅ QA 신고함 알림 시험입니다. 이 메시지가 보이면 알림이 연결된 거예요.', 0);
+  if (!sent) throw new HttpError(502, '디스코드로 보내지 못했어요. 웹훅 주소를 확인하세요');
+  return json({ ok: true });
+}
+
+function adminLink(env: Env, hash: string) {
+  return env.PUBLIC_URL ? `${env.PUBLIC_URL.replace(/\/+$/, '')}/admin/${hash}` : '';
+}
+
+const MB = 1024 * 1024;
+
+async function dailySummary(env: Env) {
+  const since = Date.now() - 24 * HOUR;
+  const fromHour = Math.floor(since / HOUR);
+  const [kinds, open, done, ev, storage] = await env.DB.batch([
+    env.DB.prepare('SELECT kind, COUNT(*) AS n FROM reports WHERE created_at >= ? GROUP BY kind ORDER BY n DESC').bind(since),
+    env.DB.prepare(`SELECT COUNT(*) AS n FROM reports WHERE status NOT IN ('done', 'wontfix')`),
+    env.DB.prepare(`SELECT COUNT(*) AS n FROM reports WHERE status = 'done' AND resolved_at >= ?`).bind(since),
+    env.DB.prepare('SELECT event, SUM(count) AS n FROM ops_counters WHERE hour >= ? GROUP BY event').bind(fromHour),
+    env.DB.prepare('SELECT COALESCE(SUM(shot_bytes), 0) AS b FROM reports'),
+  ]);
+  const k = kinds.results as { kind: string; n: number }[];
+  const total = k.reduce((a, x) => a + x.n, 0);
+  const e = Object.fromEntries((ev.results as { event: string; n: number }[]).map((x) => [x.event, x.n]));
+  const n = (r: D1Result) => (r.results[0] as { n: number } | undefined)?.n ?? 0;
+  const lines = [
+    `📊 **QA 신고함 하루 요약** (지난 24시간)`,
+    `신고 ${total}건${total ? ' — ' + k.map((x) => `${KIND_LABEL[x.kind] ?? x.kind} ${x.n}`).join(', ') : ''}`,
+    `완료 ${n(done)}건 · 처리 안 됨 ${n(open)}건`,
+    `막힌 주소 ${e['report.rejected_origin'] ?? 0} · 한도 초과 ${e['report.rate_limited'] ?? 0} · 서버 오류 ${(e['server.error'] ?? 0) + (e['r2.error'] ?? 0)} · 열쇠 실패 ${e['admin.auth_failed'] ?? 0}`,
+    `저장: DB ${((storage.meta.size_after ?? 0) / MB).toFixed(1)}MB / 사진 ${(((storage.results[0] as { b: number }).b ?? 0) / MB).toFixed(1)}MB`,
+    adminLink(env, '#/ops'),
+  ].filter(Boolean);
+  const sent = await alert(env, 'daily', lines.join('\n'), 20 * HOUR);
+  await setState(env, 'daily.last', { sent, total });
+}
+
+async function scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+  const t0 = Date.now();
+  try {
+    const health = await checkHealth(env);
+    if (!health.ok) {
+      log('error', 'health.failed', { db: health.db, r2: health.r2 });
+      await alert(env, 'health', `🚨 **QA 신고함 점검 실패** — D1 ${health.db.ok ? '정상' : '이상: ' + health.db.error} / R2 ${health.r2.ok ? '정상' : '이상: ' + health.r2.error}`, HOUR);
+    }
+
+    // 지난 한 시간에 이상하게 많은 사건
+    const lastHour = Math.floor(Date.now() / HOUR) - 1;
+    const { results } = await env.DB.prepare('SELECT event, SUM(count) AS n FROM ops_counters WHERE hour = ? GROUP BY event').bind(lastHour).all<{ event: string; n: number }>();
+    const m = Object.fromEntries(results.map((x) => [x.event, x.n]));
+    const spikes: string[] = [];
+    if ((m['report.rate_limited'] ?? 0) >= 20) spikes.push(`한도 초과 ${m['report.rate_limited']}번 — 누군가 신고를 퍼붓고 있을 수 있어요`);
+    if ((m['report.rejected_origin'] ?? 0) >= 20) spikes.push(`막힌 주소 ${m['report.rejected_origin']}번 — 허용 주소가 바뀌었거나 다른 곳에서 보내고 있어요`);
+    if ((m['admin.auth_failed'] ?? 0) >= 10) spikes.push(`관리자 열쇠 실패 ${m['admin.auth_failed']}번 — 열쇠를 바꾸는 것을 고려하세요`);
+    if ((m['report.accepted'] ?? 0) >= 50) spikes.push(`한 시간에 신고 ${m['report.accepted']}건 — 큰 문제가 생겼을 수 있어요`);
+    if (spikes.length) {
+      log('warn', 'ops.spike', { hour: lastHour, counts: m });
+      await alert(env, 'spike', `⚠️ **QA 신고함 지난 한 시간**\n- ${spikes.join('\n- ')}\n${adminLink(env, '#/ops')}`, 3 * HOUR);
+    }
+
+    // 하루 한 번 (UTC 0시 = 한국 오전 9시): 요약 + 오래된 관제 기록 정리
+    if (new Date(controller.scheduledTime).getUTCHours() === 0) {
+      await dailySummary(env);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM ops_counters WHERE hour < ?').bind(Math.floor(Date.now() / HOUR) - 24 * 35),
+        env.DB.prepare('DELETE FROM ops_errors WHERE id NOT IN (SELECT id FROM ops_errors ORDER BY id DESC LIMIT 200)'),
+      ]);
+    }
+    await setState(env, 'cron.last', { ok: health.ok, ms: Date.now() - t0, db_ms: health.db.ms, r2_ms: health.r2.ms });
+    log('info', 'cron.done', { ok: health.ok, ms: Date.now() - t0 });
+  } catch (e) {
+    await failure(env, ctx, 'cron', e, null);
+  }
+}
+
+async function handleAdmin(request: Request, env: Env, url: URL, ctx: ExecutionContext): Promise<Response> {
+  await checkAdmin(request, env, ctx);
   const path = url.pathname.replace(/^\/api\/admin/, '');
   const m = request.method;
   let r: RegExpExecArray | null;
 
   if (path === '/me' && m === 'GET') return json({ ok: true });
   if (path === '/stats' && m === 'GET') return stats(url, env);
+  if (path === '/ops' && m === 'GET') return opsOverview(url, env);
+  if (path === '/ops/test-alert' && m === 'POST') return testAlert(env);
   if (path === '/projects' && m === 'GET') return listProjects(env);
   if (path === '/projects' && m === 'POST') return createProject(request, env);
   if ((r = /^\/projects\/([a-z0-9-]+)$/.exec(path)) && m === 'PATCH') return updateProject(r[1], request, env);
@@ -453,23 +613,49 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
   throw new HttpError(404, '없는 주소예요');
 }
 
+async function route(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+  if (url.pathname === '/api/reports') {
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(request.headers.get('Origin')) });
+    if (request.method === 'POST') return submitReport(request, env, ctx);
+    throw new HttpError(405, 'POST 만 받아요');
+  }
+  if (url.pathname === '/api/health') {
+    // 외부 감시(UptimeRobot 등)용: 정상 200, D1·R2 중 하나라도 이상하면 503
+    const h = await checkHealth(env);
+    return json({ ok: h.ok, db: h.db.ok, r2: h.r2.ok, version: h.version?.id ?? null, time: Date.now() }, h.ok ? 200 : 503);
+  }
+  if (url.pathname.startsWith('/api/admin/')) return handleAdmin(request, env, url, ctx);
+  if (url.pathname.startsWith('/api/')) throw new HttpError(404, '없는 주소예요');
+  return env.ASSETS.fetch(request);
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const t0 = Date.now();
+    let res: Response;
     try {
-      if (url.pathname === '/api/reports') {
-        if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(request.headers.get('Origin')) });
-        if (request.method === 'POST') return submitReport(request, env, ctx);
-        throw new HttpError(405, 'POST 만 받아요');
-      }
-      if (url.pathname === '/api/health') return json({ ok: true, time: Date.now() });
-      if (url.pathname.startsWith('/api/admin/')) return await handleAdmin(request, env, url);
-      if (url.pathname.startsWith('/api/')) throw new HttpError(404, '없는 주소예요');
-      return env.ASSETS.fetch(request);
+      res = await route(request, env, ctx, url);
     } catch (e) {
-      if (e instanceof HttpError) return json({ ok: false, error: e.message }, e.status);
-      console.error(e);
-      return json({ ok: false, error: '서버 오류' }, 500);
+      if (e instanceof HttpError) res = json({ ok: false, error: e.message }, e.status);
+      else {
+        failure(env, ctx, url.pathname.startsWith('/api/admin/') ? 'admin' : 'request', e, request.headers.get('CF-Ray'), { path: url.pathname });
+        res = json({ ok: false, error: '서버 오류' }, 500);
+      }
     }
+    // 요청 한 줄 기록 — Workers Logs 에서 route / status / ms 로 거르고 묶기 (정상 health 는 잡음이라 뺌)
+    if (url.pathname.startsWith('/api/') && !(url.pathname === '/api/health' && res.status === 200)) {
+      const cf = (request as { cf?: { country?: string; colo?: string } }).cf;
+      log(res.status >= 500 ? 'error' : res.status >= 400 ? 'warn' : 'info', 'request', {
+        route: routeName(request.method, url.pathname),
+        status: res.status,
+        ms: Date.now() - t0,
+        ray: request.headers.get('CF-Ray'),
+        country: cf?.country,
+        colo: cf?.colo,
+      });
+    }
+    return res;
   },
+  scheduled,
 } satisfies ExportedHandler<Env>;

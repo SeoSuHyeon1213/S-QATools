@@ -26,11 +26,29 @@
       "bucket_name": "qatool-shots"
     }
   ],
+  // ── 관제 ──
+  // Workers Logs: 대시보드 > Workers > qatool > Observability 에서 로그를 찾고 거르기.
+  // 코드가 남기는 JSON 필드(event, route, status, ms, project, ray)로 바로 거를 수 있습니다.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "invocation_logs": true },
+    // 같은 오류를 묶어 보여 주는 Issues
+    "issues": { "enabled": true }
+  },
+  // 오류 위치를 원래 TypeScript 줄로 보여 줌
+  "upload_source_maps": true,
+  // 지금 돌고 있는 배포 버전 → 관리자 「관제」 탭과 /api/health 에 표시
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  // 매시 정각: D1·R2 점검 + 이상하게 많은 사건 알림. UTC 0시(한국 9시)에는 하루 요약과 정리.
+  "triggers": { "crons": ["0 * * * *"] },
   "vars": {
     // 한 곳(IP)에서 한 시간에 받을 수 있는 신고 수
     "RATE_LIMIT_PER_HOUR": "10",
     // 화면 사진 최대 크기 (바이트)
-    "MAX_SHOT_BYTES": "716800"
+    "MAX_SHOT_BYTES": "716800",
+    // 알림 메시지에 넣을 관리자 페이지 주소. 배포 뒤 실제 주소로 바꾸세요 (예: https://qatool.<계정>.workers.dev)
+    "PUBLIC_URL": ""
   }
   // 비밀 값은 vars 가 아니라 secret 으로:
   //   npx wrangler secret put ADMIN_KEY          (관리자 페이지 열쇠, 필수)

@@ -37,8 +37,10 @@ const sample = {
 
 try {
   console.log(`대상: ${BASE}`);
-  const h = await fetch(BASE + '/api/health').then((r) => r.json());
-  check('health', h.ok === true);
+  const hr = await fetch(BASE + '/api/health');
+  const h = await hr.json();
+  check('health: 200 + D1·R2 정상', hr.status === 200 && h.ok === true && h.db === true && h.r2 === true, JSON.stringify(h));
+  const opsBefore = (await admin('/ops?hours=1')).body.totals;
 
   console.log('신고 받기');
   const pre = await fetch(BASE + '/api/reports', { method: 'OPTIONS', headers: { Origin: ORIGIN, 'Access-Control-Request-Method': 'POST' } });
@@ -100,6 +102,23 @@ try {
   check('잘못된 허용 주소 400', badOrigin.status === 400);
   const resetOrigins = await admin('/projects/demo', { method: 'PATCH', body: JSON.stringify({ allowed_origins: demo.allowed_origins }) });
   check('허용 주소 저장 (막힌 기록 정리)', resetOrigins.status === 200);
+
+  console.log('관제');
+  const ops = await admin('/ops?hours=24');
+  const diff = (k) => (ops.body.totals[k] || 0) - (opsBefore[k] || 0);
+  check('관제: 접수·막힌 주소·없는 게임·큰 사진·열쇠 실패 수가 늘어남',
+    diff('report.accepted') >= 2 && diff('report.rejected_origin') >= 1 && diff('report.unknown_project') >= 1 && diff('report.too_large') >= 1 && diff('admin.auth_failed') >= 2,
+    JSON.stringify(ops.body.totals));
+  check('관제: 서버 상태와 저장 공간', ops.body.health.ok === true && ops.body.storage.reports >= 1 && ops.body.storage.shot_bytes > 0);
+  check('관제: 시간 범위', ops.body.now_hour - ops.body.from_hour === 23);
+  const noAlert = await admin('/ops/test-alert', { method: 'POST', body: '{}' });
+  check('디스코드 없으면 시험 알림 400', noAlert.status === 400);
+  const sched = await fetch(BASE + '/__scheduled?cron=' + encodeURIComponent('0 * * * *'));
+  if (sched.status === 404) console.log('  - 정기 점검 시험 건너뜀 (wrangler dev --test-scheduled 로 켜야 함)');
+  else {
+    const after = await admin('/ops?hours=1');
+    check('정기 점검(cron)이 돌고 기록됨', sched.ok && after.body.cron && after.body.cron.value.ok === true && Date.now() - after.body.cron.at < 10000, JSON.stringify(after.body.cron));
+  }
 
   console.log('한 시간 한도');
   let limited = false;
