@@ -484,7 +484,8 @@ async function renderProjects() {
     const f = new FormData(e.target);
     const origins = String(f.get('origins') || '').split(/\s+/).filter(Boolean);
     try {
-      if (e.target.id === 'newProj') {
+      // form.id 는 name="id" 입력칸에 가려지므로 속성으로 직접 읽음
+      if (e.target.getAttribute('id') === 'newProj') {
         await api('/projects', { method: 'POST', body: JSON.stringify({ id: f.get('id'), name: f.get('name'), platform: f.get('platform'), allowed_origins: origins }) });
       } else {
         await api('/projects/' + e.target.dataset.proj, { method: 'PATCH', body: JSON.stringify({ name: f.get('name'), platform: f.get('platform'), allowed_origins: origins, active: !!f.get('active') }) });
