@@ -44,7 +44,9 @@ npm run dev
 npx wrangler login
 npx wrangler d1 create qatool
 ```
-→ 나온 `database_id`를 `wrangler.jsonc`에 넣고:
+→ 나온 `database_id`를 `wrangler.jsonc`의 **`"binding": "DB"` 항목**의 `database_id`에 넣으세요.
+wrangler가 "설정 파일에 추가할까요?"라고 물어 새 항목을 덧붙였다면, 그 항목은 지우고 id만 `DB` 항목으로 옮기세요
+(코드는 `DB`만 씁니다. `d1_databases`에는 항목이 하나만 있어야 합니다).
 
 ```powershell
 npx wrangler r2 bucket create qatool-shots
@@ -58,6 +60,49 @@ npm run deploy
 
 올린 뒤 `https://qatool.<계정>.workers.dev/admin/` → **게임 · 연결** 탭에서 게임을 추가하면 붙일 코드가 나옵니다.
 운영에서는 `demo` 프로젝트의 **신고 받기**를 꺼 두세요.
+
+### GitHub에 푸시하면 자동 배포 (Workers Builds)
+
+한 번 연결해 두면 `main`에 푸시할 때마다 Cloudflare가 `npx wrangler deploy`를 대신 실행합니다 (무료: 한 달 빌드 3,000분, 동시 1개).
+
+**연결 전에 (내 컴퓨터에서 한 번)**
+1. 위의 `wrangler login` → `d1 create` → `DB` 항목에 진짜 `database_id` 넣기 → `r2 bucket create` 까지 하고, `wrangler.jsonc`를 **커밋·푸시**합니다.
+   (`database_id`는 비밀이 아니라 저장소에 올려도 됩니다. 비밀 값은 절대 `wrangler.jsonc`에 넣지 마세요.)
+2. `npm run db:migrate:remote` 로 표를 만듭니다.
+3. `PUBLIC_URL`을 쓰려면 `wrangler.jsonc`의 `vars`에 적어 커밋하세요. 배포할 때마다 이 파일의 `vars`가 대시보드 값을 덮어씁니다.
+
+**대시보드에서 연결**
+1. Workers & Pages → **만들기** → **저장소 가져오기(Import a repository)** → GitHub 앱 권한 허락 → 이 저장소 선택.
+   (이미 `npm run deploy`로 만든 Worker가 있다면: 그 Worker → **Settings → Builds → Connect**.)
+2. 설정:
+
+   | 칸 | 값 |
+   |---|---|
+   | Worker 이름 | `qatool` (`wrangler.jsonc`의 `name`과 같아야 함) |
+   | Production branch | `main` |
+   | Build command | 비워 둠 (빌드할 것 없음) |
+   | Deploy command | `npx wrangler deploy` |
+   | Root directory | `/` |
+   | Non-production branch builds (Previews) | **끔** — 켜 두면 다른 브랜치 미리보기가 운영과 같은 D1·R2에 시험 신고를 씁니다 |
+
+3. Worker → **Settings → Variables & Secrets** 에 `ADMIN_KEY`, `IP_SALT`, (선택) `DISCORD_WEBHOOK_URL`을 **Secret**으로 넣습니다.
+   빌드 설정의 *Build variables and secrets* 칸이 아닙니다 — 거기 넣은 값은 실행 중인 Worker에서 보이지 않습니다.
+4. 첫 빌드가 끝나면 관리자 페이지 **관제** 탭에서 *지금 배포된 판*이 바뀌었는지 확인합니다.
+
+**새 마이그레이션 파일을 추가할 때 (주의)**
+Workers Builds가 자동으로 만드는 배포 토큰에는 Workers·KV·R2 권한만 있고 **D1 권한이 없어서**, 빌드 안에서는 표를 바꿀 수 없습니다.
+새 코드가 새 표를 쓰므로 순서가 중요합니다. 둘 중 하나를 고르세요.
+
+- **손으로 (간단)**: `migrations/`에 파일을 추가했다면 **푸시하기 전에** `npm run db:migrate:remote` 를 먼저 실행.
+  표만 먼저 늘어나는 것은 지금 돌고 있는 코드에 영향이 없습니다.
+- **자동으로**: [API 토큰](https://dash.cloudflare.com/profile/api-tokens)을 직접 만들어 *Workers Scripts 편집 + D1 편집 + Workers R2 Storage 편집 + Account Settings 읽기* 권한을 주고,
+  빌드 설정의 **API token**에서 그 토큰을 고른 뒤 Deploy command를 이렇게 바꿉니다:
+
+  ```
+  npx wrangler d1 migrations apply qatool --remote && npx wrangler deploy
+  ```
+
+**되돌리기**: 배포가 잘못됐으면 Worker → **Deployments** 에서 이전 버전을 골라 *Rollback*. (D1 표 변경은 되돌려지지 않으니, 마이그레이션은 열(column)·표를 **추가만** 하는 식으로 쓰는 것이 안전합니다.)
 
 ## 관제 (배포 뒤 상태 보기)
 
